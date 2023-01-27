@@ -32,38 +32,36 @@ else:
     from pathlib import Path
 
 
-"""
-Logger
-======
-"""
-db_feeder_dir = Path(__file__).parent
-logger = logging.getLogger("Threshold Calculator")
-# set the logging level
-logger.setLevel(logging.DEBUG)
-# create a console and file handler
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-fh = logging.FileHandler(db_feeder_dir.joinpath("log_thershold_calculator.txt"))
-fh.setLevel(logging.WARNING)
-# create a formatter
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# set the formatter to the console handler
-ch.setFormatter(formatter)
-fh.setFormatter(formatter)
-# add the console handler to the logger
-logger.addHandler(ch)
-logger.addHandler(fh)
-
-
 # Setting global paths
-global graph_path, excel_path, seq_tax_map_path
-graph_path = Path(__file__).parent.joinpath("similarity_heatmap.png")
-excel_path = Path(__file__).parent.joinpath("similarity_matrix.xlsx")
-seq_tax_map_path = Path(__file__).parent.joinpath("seqid_taxonomy_map.tsv")
+global SEQ_TAX_MAP_PATH, EXCEL_PATH, GRAPH_PATH, OUTPUT_DIR
+OUTPUT_DIR = Path(__file__).parent.joinpath("threshold_calculator_output")
+GRAPH_PATH = OUTPUT_DIR.joinpath("similarity_heatmap.png")
+EXCEL_PATH = OUTPUT_DIR.joinpath("similarity_matrix.xlsx")
+SEQ_TAX_MAP_PATH = OUTPUT_DIR.joinpath("seqid_taxonomy_map.tsv")
 
 
-def defval_str():
-    return ""
+def gimmelogger():
+    """
+    Logger
+    ======
+    """
+    logger = logging.getLogger("Threshold Calculator")
+    # set the logging level
+    logger.setLevel(logging.DEBUG)
+    # create a console and file handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    fh = logging.FileHandler(OUTPUT_DIR.joinpath("log_thershold_calculator.txt"))
+    fh.setLevel(logging.WARNING)
+    # create a formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # set the formatter to the console handler
+    ch.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    # add the console handler to the logger
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
 
 
 def sort_tax_dict(tax_dict: tuple, sort_level: int):
@@ -121,8 +119,8 @@ def get_header_seq_dict(file_path,
     - ind_to: the index to slice to the cut header
     - tax_sep: seperator of taxonomy levels
     """
-    fasta_dict = ddict(defval_str)
-    tax_dict = ddict(defval_str)
+    fasta_dict = ddict(str)
+    tax_dict = ddict(str)
     file_path = Path(file_path).resolve()
     logger.info(f"Reading and parsing file: {file_path.name}")
     # should_sort = sort_level in list(range(6))
@@ -194,10 +192,14 @@ def parse_fastas_to_dict(file_list, sort_level=-1):
                 key=lambda x: x[1][sort_level:sort_level + 1]
             )
         )
-        # Updating the seq_tax_map_path path to include sortlevel
-        global seq_tax_map_path
-        new_seqtaxmap = seq_tax_map_path.parent.joinpath(
-            f"{seq_tax_map_path.stem}_{sort_level_name}.tsv")
+        sort_factor_d = ddict(list)
+        for ke, vl in taxs_dict.items():
+            tax_level_factor = vl[sort_level:sort_level + 1][0] if vl[sort_level:sort_level + 1] else ""
+            sort_factor_d[tax_level_factor] += [ke]
+        # Updating the SEQ_TAX_MAP_PATH path to include sortlevel
+        global SEQ_TAX_MAP_PATH
+        new_seqtaxmap = OUTPUT_DIR.joinpath(
+            f"{SEQ_TAX_MAP_PATH.stem}_{sort_level_name}.tsv")
         # Write the seqid_tax map and order fastas_dict
         with open(new_seqtaxmap, "w") as fileo:
             csvwriter = csv.writer(fileo, delimiter="\t")
@@ -223,7 +225,7 @@ def parse_fastas_to_dict(file_list, sort_level=-1):
                 taxs_dict[header] = fastas_dict[header]
         fastas_dict = taxs_dict
     # return
-    return fastas_dict, sort_level_name
+    return fastas_dict, sort_level_name, sort_factor_d
 
 
 def calculat_similarity(seq_one_t: tuple, seq_two_t: tuple):
@@ -259,6 +261,88 @@ def calculat_similarity(seq_one_t: tuple, seq_two_t: tuple):
     return h1, h2, sim_score
 
 
+def calculate_group_sim_avg(matrix, seq_headers: list, tax_level):
+    """
+    It gets sub-matrix of of matrix by rows and columns
+    then calculates average similarity score and returns it.
+    **Arguments:**
+    ==============
+    - matrix: a dataframe containing the rows and columns as sequnce headers
+    - seq_headers: a list of sequence headers we want to calculate their combination averge
+        similairy
+    - tax_level: the group member of sorted level tax set
+    """
+    cum_sim = 0.0
+    tot_count = 0
+    if len(seq_headers) > 1:
+        seq_h_comb = itertools.combinations(seq_headers, 2)
+    elif len(seq_headers) == 1:
+        seq_h_comb = [(seq_headers[0], seq_headers[0])]
+    else:
+        raise ValueError("seq_heades should be a list containg sequnce headers. It's empty!")
+
+    for comb in seq_h_comb:
+        cum_sim += matrix.loc[comb[0], comb[1]]
+        tot_count += 1
+    avg_sim = round(cum_sim / tot_count, 4)
+    return seq_headers, tax_level, avg_sim
+
+
+def write_avg_sim_tsv(taxlevel_seqheader: dict, matrix, sort_level_name=""):
+    """
+    Takes a taxlevel_seqheader dictionary and a similarity matrix and writes a tsv file
+    containing the sequence headers as first column, tax_level value to which sort has
+     happend as the second and the average similarity of the level.
+     **Arguments:**
+     - taxlevel_seqheader: a dictionary like {"uniq_val_sorted_tax_level": [seqheader1, seqheader2, ...]}
+     - matrix: a panadas dataframe containing the pairwise similarities of sequences
+    """
+    global SEQ_TAX_MAP_PATH
+    avg_sim_dir = OUTPUT_DIR
+    # Calculating averages
+    group_sim_tasks = {}
+    with ProcessPoolExecutor() as executer:
+        for tax_level, seqlist in tqdm(taxlevel_seqheader.items(),
+                                       total=int(len(taxlevel_seqheader)),
+                                       desc="Calulating Group Similarities",
+                                       unit="Groups"):
+            group_sim_tasks.update({
+                executer.submit(calculate_group_sim_avg, matrix, seqlist, tax_level): tax_level
+            })
+    completed_tasks = as_completed(group_sim_tasks)
+    rows_to_write = []
+    for ct in completed_tasks:
+        try:
+            seq_headers, tax_level, avg_sim = ct.result()
+        except Exception as exc:
+            logger.warning(f"Group similarity calculation failed for {tax_level}. {str(exc)}")
+        else:
+            for seq_h in seq_headers:
+                rows_to_write.append([seq_h, tax_level, avg_sim])
+    # Writing all to a file
+    sort_part = f"_{sort_level_name}" if sort_level_name else ""
+    avg_sim_file = avg_sim_dir.joinpath(f"avg_sims{sort_part}.tsv")
+    # avg_sim_dir.mkdir(parents=True, exist_ok=True)
+    # logger.info(f"Created directory: {avg_sim_dir}")
+    if rows_to_write:
+        with open(avg_sim_file, "w") as filew:
+            csvwriter = csv.writer(filew, delimiter="\t")
+            csv_header = ["SeqID", "Group", "Average_Similarity"]
+            csvwriter.writerow(csv_header)
+            for map_row in rows_to_write:
+                csvwriter.writerow(map_row)
+    else:
+        avg_sim_file = ""
+        try:
+            # if directory is empty it removes it in case of failure
+            avg_sim_dir.rmdir()
+        except Exception:
+            pass
+        logger.warning(f"No values to write to {avg_sim_file}!")
+
+    return avg_sim_file
+
+
 def create_sim_matrix(files_list, sort_level=-1):
     """
     **Arguments:**
@@ -266,7 +350,9 @@ def create_sim_matrix(files_list, sort_level=-1):
     - file_list: a list of fasta files
     - sort_level: taxonomy level with which the headers are sorted
     """
-    fastas_dict, sort_level_name = parse_fastas_to_dict(files_list, sort_level=sort_level)
+    parse_fastas_result = parse_fastas_to_dict(files_list, sort_level=sort_level)
+    fastas_dict, sort_level_name, sortedtaxlevel_seqh_dict = parse_fastas_result
+    # Preparing headers
     headers_list = list(fastas_dict.keys())
     init_zero_matrix = {el: [0.0] * len(headers_list) for el in headers_list}
     matrix = pd.DataFrame(init_zero_matrix, index=headers_list, columns=headers_list)
@@ -302,19 +388,26 @@ def create_sim_matrix(files_list, sort_level=-1):
     )
     fig = sns_plot.get_figure()
     # Updating the output path according to sort level
-    global excel_path, graph_path
-    new_excel_path = excel_path
-    new_graph_path = graph_path
+    global EXCEL_PATH, GRAPH_PATH
+    new_excel_path = EXCEL_PATH
+    new_graph_path = GRAPH_PATH
     if sort_level_name:
-        new_excel_path = excel_path.parent.joinpath(
-            f"{excel_path.stem}_{sort_level_name}.xlsx")
-        new_graph_path = graph_path.parent.joinpath(
-            f"{graph_path.stem}_{sort_level_name}.png")
+        new_excel_path = OUTPUT_DIR.joinpath(
+            f"{new_excel_path.stem}_{sort_level_name}.xlsx")
+        new_graph_path = OUTPUT_DIR.joinpath(
+            f"{new_graph_path.stem}_{sort_level_name}.png")
     # Writing to the graph and matrix to files
     matrix.to_excel(new_excel_path)
     fig.savefig(new_graph_path)
     # Clears the Axes to avoid multiple colorbar
     plt.clf()
+    # TODO Calculate similarity averages using sortedtaxlevel_seqh_dict
+    avg_sim_file_path = write_avg_sim_tsv(
+        sortedtaxlevel_seqh_dict,
+        matrix,
+        sort_level_name
+    )
+    logger.info("Averge similarities written to {avg_sim_file_path}")
 
 
 def main(files_list, sort_level_range: list = range(4, 6)):
@@ -329,7 +422,18 @@ def main(files_list, sort_level_range: list = range(4, 6)):
 
 
 if __name__ == "__main__":
+    # global OUTPUT_DIR
     parser = argparse.ArgumentParser()
+    parser.add_argument('-o', '--output-dir',
+                        type=str,
+                        default=OUTPUT_DIR,
+                        required=False,
+                        help="The dirctory to put the result")
     parser.add_argument("files", nargs='+', help="list of fasta files")
     args = parser.parse_args()
-    main(args.files, range(4, 7))
+    OUTPUT_DIR = Path(args.output_dir)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # setting logger
+    global logger
+    logger = gimmelogger()
+    main(args.files, range(4, 6))
